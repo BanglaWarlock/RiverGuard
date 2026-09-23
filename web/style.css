@@ -1,0 +1,243 @@
+/* RiverGuard website styles - plain CSS, one file. */
+
+* {
+    box-sizing: border-box;
+    margin: 0;
+}
+
+body {
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    color: #1c2b36;
+}
+
+/* ---- top bar ---- */
+header {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 10px 16px;
+    background: #14324f;
+    color: #fff;
+}
+
+header .title {
+    font-size: 18px;
+    font-weight: 700;
+}
+
+header .subtitle {
+    font-weight: 400;
+    opacity: .65;
+    font-size: 13px;
+}
+
+header .stats {
+    margin-left: auto;
+    font-size: 13px;
+    display: flex;
+    gap: 16px;
+    align-items: center;
+}
+
+header button {
+    background: #2a5b8c;
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    padding: 5px 12px;
+    cursor: pointer;
+    font-size: 12px;
+}
+
+header button:hover {
+    background: #38749f;
+}
+
+/* stream status dot in the stats strip */
+.dot {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: #888;
+    display: inline-block;
+}
+
+.dot.live {
+    background: #6fe08a;
+    box-shadow: 0 0 4px #6fe08a;
+}
+
+/* ---- layout: map + sidebar ---- */
+main {
+    flex: 1;
+    display: flex;
+    min-height: 0;
+}
+
+#map {
+    flex: 1;
+    background: #cfd8dc;
+}
+
+#sidebar {
+    width: 360px;
+    overflow-y: auto;
+    background: #f6f8fa;
+    border-left: 1px solid #dde3e9;
+}
+
+section {
+    padding: 12px 14px;
+    border-bottom: 1px solid #e4e9ee;
+}
+
+h2 {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: .07em;
+    color: #5b6b7b;
+    margin-bottom: 8px;
+}
+
+/* ---- village cards ---- */
+.village-card {
+    background: #fff;
+    border: 1px solid #e0e6ec;
+    border-radius: 8px;
+    padding: 10px 12px;
+    margin-bottom: 8px;
+    cursor: pointer;
+    border-left: 4px solid #bbb;
+}
+
+.village-card:hover {
+    border-color: #9db3c8;
+}
+
+.village-card.offline {
+    opacity: .55;
+}
+
+.village-card .row1 {
+    display: flex;
+    justify-content: space-between;
+    font-weight: 600;
+}
+
+.village-card .counts {
+    font-size: 12px;
+    color: #5b6b7b;
+    margin-top: 4px;
+}
+
+/* ---- selected node panel ---- */
+#node-details dl {
+    display: grid;
+    grid-template-columns: 110px 1fr;
+    row-gap: 5px;
+    font-size: 13px;
+}
+
+#node-details dt {
+    color: #5b6b7b;
+}
+
+#node-details dd {
+    font-weight: 600;
+}
+
+.chip {
+    display: inline-block;
+    padding: 1px 8px;
+    border-radius: 10px;
+    color: #fff;
+    font-size: 12px;
+    font-weight: 600;
+}
+
+.chip.offline-chip {
+    background: #757575;
+}
+
+.chip.online-chip {
+    background: #43a047;
+}
+
+.spark {
+    margin-top: 10px;
+}
+
+.spark .label {
+    font-size: 11px;
+    color: #5b6b7b;
+    margin-bottom: 3px;
+}
+
+/* ---- alert feed ---- */
+#alert-feed {
+    max-height: 320px;
+    overflow-y: auto;
+}
+
+.alert-entry {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    background: #fff;
+    border: 1px solid #e7ebef;
+    border-radius: 6px;
+    padding: 6px 8px;
+    margin-bottom: 6px;
+    font-size: 13px;
+}
+
+.alert-entry.new {
+    animation: flash 1.6s ease-out;
+}
+
+@keyframes flash {
+    0% {
+        background: #fff3c4;
+    }
+
+    100% {
+        background: #fff;
+    }
+}
+
+.alert-entry .badge {
+    flex: 0 0 auto;
+    font-size: 11px;
+    font-weight: 700;
+    color: #fff;
+    border-radius: 4px;
+    padding: 1px 6px;
+    white-space: nowrap;
+}
+
+.alert-entry .who {
+    font-weight: 600;
+}
+
+.alert-entry .what {
+    flex: 1;
+}
+
+.alert-entry time {
+    font-size: 11px;
+    color: #8a97a3;
+}
+
+.empty {
+    font-size: 13px;
+    color: #8a97a3;
+    font-style: italic;
+}
+
+header .stats span small {
+    opacity: .7;
+    font-weight: 400;
+}

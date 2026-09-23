@@ -1,2 +1,11 @@
 /.stfolder/
 /PLAN.md
+parser/.env
+__pycache__/
+.env
+reporter/reports/*
+tools/stress/results/*
+parser.md
+redis_runner_ins.txt
+*/.env
+*.log

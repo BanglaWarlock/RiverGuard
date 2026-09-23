@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>RiverGuard — Flood Monitoring</title>
+
+  <!-- Leaflet (the map) from a CDN - nothing to install or build -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <div class="title">RiverGuard <span class="subtitle">flood monitoring</span></div>
+    <div class="stats" id="stats"></div>
+    <button id="refresh-btn" title="Reload all data from the API">Refresh</button>
+  </header>
+
+  <main>
+    <div id="map"></div>
+
+    <aside id="sidebar">
+      <section>
+        <h2>Villages</h2>
+        <div id="village-list"></div>
+      </section>
+
+      <!-- Hidden until a node marker is clicked -->
+      <section id="node-section" hidden>
+        <h2 id="node-title"></h2>
+        <div id="node-details"></div>
+      </section>
+
+      <section>
+        <h2>Live alerts</h2>
+        <div id="alert-feed"></div>
+      </section>
+    </aside>
+  </main>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="js/config.js"></script>
+  <script src="js/state.js"></script>
+  <script src="js/map.js"></script>
+  <script src="js/sidebar.js"></script>
+  <script src="js/alerts.js"></script>
+  <script src="js/stream.js"></script>
+  <script src="js/main.js"></script>
+</body>
+</html>
