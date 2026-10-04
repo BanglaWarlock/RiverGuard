@@ -8,5 +8,51 @@
 <body>
     <h1>RiverGuard Software Architecture</h1>
     <p> Future content in progress</p>
+
+    <p class="note">Rendered by Mermaid + iconify at runtime - needs internet on the viewer's side.</p>
+    
+    <pre class="mermaid-source">
+    flowchart LR
+        NODES["{{logos:espressif}} Sensor Nodes"]
+        STATION["{{logos:espressif}} Master Station"]
+        BROKER["{{logos:100tb}} MQTT Broker"]
+        PARSER["{{logos:python}} Parser"]
+        MONGO[("{{logos:mongodb}} MongoDB")]
+        REDIS[("{{logos:redis}} Redis")]
+        API["{{logos:python}} API"]
+        BROWSER["{{logos:javascript}} Website"]
+    
+        NODES --> STATION
+        STATION -- "MQTT :1883" --> BROKER
+        BROKER -- subscribe --> PARSER
+        PARSER -- insert --> MONGO
+        PARSER -. publish .-> REDIS
+        REDIS -. subscribe .-> API
+        BROWSER -. "REST pull :8000" .-> API
+        API -- "SSE push :8000" --> BROWSER
+        API -- query --> MONGO
+        </pre>
+    
+    <script type="module">
+        import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+
+        // {{collection:icon}} -> iconify <img> tag (fetched at render time)
+        const ICON = (name, size = 22) =>
+            `<img src='https://api.iconify.design/${name}.svg' width='${size}'/>`;
+
+        const el = document.querySelector(".mermaid-source");
+        const source = el.textContent.replace(
+            /\{\{([^}]+)\}\}/g,
+            (_, name) => ICON(name.trim())
+        );
+
+        mermaid.initialize({
+            securityLevel: "loose",
+            flowchart: { useMaxWidth: false, htmlLabels: true },
+        });
+
+        const { svg } = await mermaid.render("archDiagram", source);
+        el.innerHTML = svg;
+    </script>
 </body>
 </html>
