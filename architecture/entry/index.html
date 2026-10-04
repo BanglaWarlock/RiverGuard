@@ -13,14 +13,14 @@
     
     <pre class="mermaid-source">
     flowchart LR
-        NODES["{{logos:espressif}} Sensor Nodes"]
-        STATION["{{logos:espressif}} Master Station"]
-        BROKER["{{logos:100tb}} MQTT Broker"]
-        PARSER["{{logos:python}} Parser"]
-        MONGO[("{{logos:mongodb}} MongoDB")]
-        REDIS[("{{logos:redis}} Redis")]
-        API["{{logos:python}} API"]
-        BROWSER["{{logos:javascript}} Website"]
+        NODES["{{carbon:network-4}} Sensor Nodes"]
+        STATION["{{lsicon:online-gateway-filled}} Master Station"]
+        BROKER["{{selfhst:mqtt}} MQTT Broker"]
+        PARSER["{{devicon:python}} Parser"]
+        MONGO[("{{vscode-icons:file-type-mongo}} MongoDB")]
+        REDIS[("{{devicon:redis}} Redis")]
+        API["{{skill-icons:fastapi}} API"]
+        BROWSER["{{fluent-mdl2:website}} Website"]
     
         NODES --> STATION
         STATION -- "MQTT :1883" --> BROKER
