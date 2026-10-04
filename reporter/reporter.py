@@ -61,10 +61,10 @@ WINDOW_HOURS = 24        # how much history each report covers
 INTERVAL_HOURS = 24      # schedule: every N hours (when DAILY_AT is None)
 DAILY_AT = None          # e.g. "08:00" local time - overrides the schedule
 
-# --- recipients (add as many as you like) ----------------------------------
+#  recipients (add as many as you like) 
 RECIPIENTS = ["aqib.mohiuddin08@gmail.com", "102782478@students.swinburne.edu.my"]     # <-- YOUR TWO EMAILS
 
-# --- sending account -------------------------------------------------------
+#  sending account 
 # The SENDER is one of your emails. The app password is NOT your normal
 # Gmail password:
 #   Google Account -> Security -> 2-Step Verification (must be on) ->
