@@ -14,3 +14,6 @@ merm2.html
 mermaid.mmd
 mermaid2.mermaid
 mermtry.md
+mqtt/data/*
+mqtt/log/*
+mongo/data/*

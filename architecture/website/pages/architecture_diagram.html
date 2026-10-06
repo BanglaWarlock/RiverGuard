@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="utf-8">
+    <title>RiverGuard Diagram</title>
+    <style>
+        html,
+        body {
+            margin: 0;
+            height: 100%;
+            font-family: system-ui;
+            background: #fff;
+        }
+
+        #wrap {
+            width: 100vw;
+            height: 100vh;
+        }
+
+        .mermaid-source {
+            width: 100%;
+            height: 100%;
+        }
+
+        .mermaid-source svg {
+            width: 100%;
+            height: 100%;
+            max-width: none !important;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="wrap">
+        <pre class="mermaid-source">
+        flowchart LR
+        subgraph hardware["{{famicons:hardware-chip}} Field Hardware"]
+            direction BT
+            mesh_node["{{game-icons:mesh-network}} Sensor Node \n LoRa Mesh"] --> 
+            gateway_station["{{lsicon:online-gateway-outline}} Gateway Node \n With internet"]
+        end
+
+        mqtt["{{thesvg-color:mqtt}} MQTT Broker"] 
+        hardware --> mqtt
+        </pre>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/svg-pan-zoom@3.6.1/dist/svg-pan-zoom.min.js"></script>
+
+    <script type="module">
+        import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+
+        // {{collection:icon}} or {{collection:icon:size}}
+        const ICON = (name, size) =>
+            `<img src='https://api.iconify.design/${name}.svg' width='${size}'/>`;
+
+        // {{table:name}} -> entry from this dictionary
+        const TABLES = {
+            // example - copy the pattern for real tables
+            example: `
+                <table style='border-collapse:collapse;font-size:11px'>
+                    <tr><th align='left'>param</th><th>value</th></tr>
+                    <tr><td>uptime</td><td>17 min</td></tr>
+                </table>`,
+        };
+        const TABLE = (name) => TABLES[name] || "(unknown table)";
+
+        const el = document.querySelector(".mermaid-source");
+        const source = el.textContent
+            .replace(/\{\{table:([^}]+)\}\}/g, (_, n) => TABLE(n.trim()))
+            .replace(/\{\{([^}]+)\}\}/g, (_, token) => {
+                const parts = token.trim().split(":");
+                // two parts = collection:icon, three = collection:icon:size
+                const size = parts.length === 3 ? parts.pop() : 22;
+                return ICON(parts.join(":"), size);
+            });
+
+        mermaid.initialize({
+            securityLevel: "loose",
+            flowchart: { useMaxWidth: false, htmlLabels: true },
+        });
+
+        const { svg } = await mermaid.render("mainDiagram", source);
+        el.innerHTML = svg;
+
+        // ------------------------------------------------------------
+        // Pan + zoom: full window, centered, readable size; wheel to
+        // zoom, drag to pan, controls bottom-right.
+        // ------------------------------------------------------------
+        svgPanZoom(document.querySelector(".mermaid-source svg"), {
+            zoomEnabled: true,
+            controlIconsEnabled: true,
+            fit: false,
+            center: true,
+            minZoom: 0.2,
+            maxZoom: 10,
+            beforeInit: (svg) => {
+                svg.setAttribute("width", "100%");
+                svg.setAttribute("height", "100%");
+            },
+        });
+    </script>
+</body>
+
+</html>
