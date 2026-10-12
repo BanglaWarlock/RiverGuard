@@ -14,11 +14,7 @@ import threading
 stop_event = threading.Event()
 
 state = {
-    "database": None,
-    "redis": None,
-    "mqtt": None,
+    "db": None,               # the database handle (database_helper reads this)
+    "database_client": None,   # the MongoClient (cleanup closes this)
+    "redis": None,            # None = Redis down, parser continues
 }
-
-# Counters for the periodic [stats] line (stress testing).
-# Incremented in mqtt_handlers, reported by main's stats thread.
-message_count = 0

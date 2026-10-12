@@ -1,22 +1,24 @@
 @echo off
-REM RiverGuard - start the local MQTT broker (Eclipse Mosquitto in Docker).
-REM Idempotent: already-running containers are skipped; missing ones
-REM are created (pulling the image if needed).
+REM RiverGuard - start the MQTT broker (Eclipse Mosquitto), standalone.
+REM Joins the shared network (same one compose uses), so containerized
+REM services reach it as 'riverguard-eclipse' whether started here or
+REM by compose. Also publishes localhost:1883 for python-run services
+REM and ESP32s. Not part of the compose stack - alternative mode.
 
-REM echo [mqtt] Starting Eclipse broker...
+REM --- the shared network (no-op if it exists; compose creates it too) ---
+docker network create riverguard-docker-network 2>nul
 
-docker start riverguard-eclipse 2>nul
-if errorlevel 1 (
-    @REM  echo [mqtt] Container not found - creating it...
-    docker run -d --name riverguard-eclipse ^
-        -p 1883:1883 ^
-        -v "%~dp0conf:/mosquitto/config" ^
-        -v "%~dp0data:/mosquitto/data" ^
-        -v "%~dp0log:/mosquitto/log" ^
-        eclipse-mosquitto:latest
-)
+docker start riverguard-eclipse >nul 2>&1
+if not errorlevel 1 goto ok
 
-REM echo.
-REM echo [mqtt] MQTT broker   : localhost:1883
-REM echo.
-REM pause
+echo [mqtt] Creating the container...
+docker run -d --name riverguard-eclipse --restart unless-stopped ^
+    --network riverguard-docker-network ^
+    -p 1883:1883 ^
+    -v "%~dp0conf:/mosquitto/config" ^
+    -v "%~dp0data:/mosquitto/data" ^
+    -v "%~dp0log:/mosquitto/log" ^
+    eclipse-mosquitto:latest || (echo [mqtt] failed to create. & pause & exit /b 1)
+
+:ok
+echo [mqtt] running. localhost:1883 (host) / riverguard-eclipse:1883 (network)

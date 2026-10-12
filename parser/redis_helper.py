@@ -2,19 +2,16 @@
 Written by Aqib-Al-Mohiuddin
 Written as part of a Research Assistant project at Swinburne University of Technology, Sarawak.
 
-This file contains helper functions for handling Redis communication.
-
-Reminder: pub/sub stores NOTHING. If Redis is down, or the API isn't
-subscribed at this exact moment, the message is gone - which is fine,
-because the database is the source of truth and Redis is only the
-"something just happened" tap on the shoulder.
+Publish to Redis - the parser's notification to the API.
+Pub/sub stores NOTHING: if Redis is down, the message is simply not
+delivered; the database remains the source of truth.
 """
 
 import json
 import state
+import logger
 
-"""Publish one JSON message on a Redis channel.
-    No-op (with warning) if Redis is down - database writes already succeeded."""
+# One JSON message on a channel. No-op if Redis is down.
 def publish(channel, message):
     redis_client = state.state["redis"]
     if redis_client is None:
@@ -22,4 +19,4 @@ def publish(channel, message):
     try:
         redis_client.publish(channel, json.dumps(message))
     except Exception as e:
-        print(f"  - [Redis] publish to {channel} failed: {e}")
+        logger.log_error(f"redis publish {channel}", e)

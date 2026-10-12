@@ -1,2 +1,6 @@
 __pycache__/
 *.pyc
+.env
+logs/
+0file_dump.py
+.env.docker

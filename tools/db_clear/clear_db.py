@@ -1,96 +1,72 @@
 """
-RiverGuard database reset script.
+RiverGuard database reset - drops all collections in the local database.
 
-Deletes everything the parser has written so the next test run starts
-from a clean, predictable state (fresh counters, empty collections).
+Convenience: stops the parser first (so it doesn't write mid-clear and
+recreate indexes mid-drop), clears, then restarts it. The API is NOT
+restarted - it reads the database per-request, so the website shows the
+cleared state on its next refresh automatically.
 
-What it clears (drops entirely):
-  global_stats, villages, master_nodes, river_nodes, telemetry,
-  alerts, events, program_logs, heartbeats (legacy)
-
-Notes:
-  - Redis needs no clearing: we only use pub/sub, which stores nothing.
-  - Stop the parser BEFORE running this. If the parser keeps running
-    while collections are dropped, its counters drift from the database.
-    After clearing, start the parser again - it recreates the indexes
-    and the global_stats document automatically on startup.
-
-Usage:
-  python clear_db.py          asks "are you sure?" first
-  python clear_db.py --yes    no prompt (for scripts)
+Usage: python clear_db.py          (asks 'yes' first)
+       python clear_db.py --yes    (no prompt - for scripts/bats)
 """
 
+import subprocess
 import sys
-import datetime
 from pymongo import MongoClient
 
-DB_URI = "mongodb+srv://test:test@banglacluster.ntnbhcq.mongodb.net/?appName=BanglaCluster"
+DB_URI = "mongodb://localhost:27017"
 DB_NAME = "RiverGuard"
 
-# Every collection the system uses, plus the legacy heartbeats collection
-# from the old combined-heartbeat version (drop is a no-op if missing).
-# Remove "program_logs" from this list if you ever want to keep logs.
-COLLECTIONS = [
-    "global_stats",
-    "villages",
-    "master_nodes",
-    "river_nodes",
-    "telemetry",
-    "alerts",
-    "events",
-    "program_logs",
-    "heartbeats",   # legacy, pre-v2
-]
+COLLECTIONS = ["mesh_nodes", "telemetry", "route_reports",
+               "blacklists", "current_blacklist"]
 
+PARSER_CONTAINER = "riverguard-parser"
+
+def docker(*args):
+    """Run a docker command quietly; returns True/False."""
+    r = subprocess.run(["docker", *args], capture_output=True, text=True)
+    return r.returncode == 0
+
+def parser_running():
+    r = subprocess.run(
+        ["docker", "ps", "--filter", f"name={PARSER_CONTAINER}",
+         "--filter", "status=running", "--format", "{{.Names}}"],
+        capture_output=True, text=True)
+    return PARSER_CONTAINER in r.stdout
 
 def main():
-    # 1. Connect
-    client = MongoClient(DB_URI)
-    db = client[DB_NAME]
+    db = MongoClient(DB_URI)[DB_NAME]
 
-    # 2. Show what is about to be deleted (document counts per collection)
-    print(f"Connected to {DB_NAME}. Collections to clear:\n")
-    total = 0
-    for name in COLLECTIONS:
-        count = db[name].count_documents({})
-        total += count
-        print(f"  {name:<15} {count:>6} document(s)")
-    print(f"\nTotal: {total} document(s) in {len(COLLECTIONS)} collections.")
-
-    if total == 0:
-        print("Database is already empty - nothing to do.")
-        client.close()
+    total = sum(db[c].count_documents({}) for c in COLLECTIONS)
+    if total == 0 and not parser_running():
+        print("Already empty, parser not running - nothing to do.")
         return
 
-    # 3. Confirm (skipped with --yes)
-    if "--yes" not in sys.argv:
-        answer = input("\nType 'yes' to permanently delete these: ")
-        if answer.strip().lower() != "yes":
-            print("Cancelled - nothing was deleted.")
-            client.close()
-            return
+    was_running = parser_running()
 
-    # 4. Drop each collection
-    for name in COLLECTIONS:
-        db[name].drop()
-        print(f"  dropped {name}")
+    print(f"Clearing {total} document(s) from {len(COLLECTIONS)} collections.")
+    if was_running:
+        print(f"(parser is running - it will be stopped and restarted)")
+    if "--yes" not in sys.argv and input("Type 'yes' to confirm: ").strip() != "yes":
+        print("Cancelled.")
+        return
 
-    # 5. Fresh zeroed global_stats, so /stats never 404s or returns {}
-    #    between the clear and the next parser start (the parser resyncs
-    #    these numbers itself on startup anyway).
-    db.global_stats.insert_one({
-        "_id": "global",
-        "masters_online": 0,
-        "masters_offline": 0,
-        "river_nodes_online": 0,
-        "river_nodes_offline": 0,
-        "updated_at": datetime.datetime.utcnow(),
-    })
+    # 1. stop the parser (no mid-clear writes, no index recreation races)
+    if was_running:
+        docker("stop", PARSER_CONTAINER)
+        print(f"[clear] {PARSER_CONTAINER} stopped")
 
-    print("\nDone. Database is clean.")
-    print("Reminder: if the parser was running, restart it now.")
-    client.close()
+    # 2. drop
+    for c in COLLECTIONS:
+        db[c].drop()
+    print(f"[clear] {total} document(s) dropped")
 
+    # 3. restart the parser - it recreates indexes on startup
+    if was_running:
+        docker("start", PARSER_CONTAINER)
+        print(f"[clear] {PARSER_CONTAINER} restarted (indexes recreated on startup)")
+
+    print("[clear] done. Website: refresh to see the empty state.")
 
 if __name__ == "__main__":
     main()

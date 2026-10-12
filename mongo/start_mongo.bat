@@ -1,21 +1,22 @@
 @echo off
-REM RiverGuard - start the local MongoDB (official image, pinned).
-REM The data volume is REQUIRED - without it, removing the container
-REM means losing the database.
+REM RiverGuard - start MongoDB (official image, pinned).
+REM Joins the shared network (same one compose uses). The data volume
+REM is REQUIRED - without it, removing the container means losing the
+REM database. Not part of the compose stack - alternative mode.
 
-echo [mongo] Starting MongoDB...
+REM --- the shared network (no-op if it exists; compose creates it too) ---
+docker network create riverguard-docker-network 2>nul
 
-docker start riverguard-mongo 2>nul
-if errorlevel 1 (
-    echo [mongo] Container not found - creating it...
-    docker run -d --name riverguard-mongo ^
-        -p 27017:27017 ^
-        -v "%~dp0data:/data/db" ^
-        mongo:7.0
-)
+docker start riverguard-mongo >nul 2>&1
+if not errorlevel 1 goto ok
 
-echo.
-echo [mongo] MongoDB      : mongodb://localhost:27017
-echo [mongo] (optional UI): docker run -d --name mongo-express -p 8081:8081 -e ME_CONFIG_MONGODB_SERVER=host.docker.internal mongo-express
-echo.
-pause
+echo [mongo] Creating the container...
+docker run -d --name riverguard-mongo --restart unless-stopped ^
+    --network riverguard-docker-network ^
+    -p 27017:27017 ^
+    -v "%~dp0data:/data/db" ^
+    mongo:7.0 || (echo [mongo] failed to create. & pause & exit /b 1)
+
+:ok
+echo [mongo] running. mongodb://localhost:27017 (host) / mongodb://riverguard-mongo:27017 (network)
+echo [mongo] browse the data: browse_mongo.bat

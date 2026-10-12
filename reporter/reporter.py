@@ -1,357 +1,207 @@
 """
-RiverGuard reporter service - periodic email reports (Milestone 2b).
+Written by Aqib-Al-Mohiuddin
+Written as part of a Research Assistant project at Swinburne University of Technology, Sarawak.
 
-A standalone service, same pattern as parser/api. Every interval it:
-  1. Queries MongoDB for everything that happened in the report window
-  2. Renders an HTML report (email-safe: inline CSS, no images/scripts)
-  3. ALWAYS saves it to reporter/reports/  -> demoable without any email
-     setup, and an archive of what was sent (audit trail)
-  4. Emails it to RECIPIENTS if SMTP is configured
+Daily email report: raw CSV of the last reporting window's messages.
 
-Scheduling (the "flexible timestamp intervals"):
-  INTERVAL_HOURS = 1    -> hourly reports
-  INTERVAL_HOURS = 24   -> daily reports
-  INTERVAL_HOURS = 0.05 -> every 3 minutes (quick demo - set back after!)
-  DAILY_AT = "08:00"    -> daily at a fixed local time (overrides interval)
+Run as a ONE-SHOT container (Task Scheduler -> bat -> docker run --rm):
+  1. Read last-reported timestamp from state/ (volume - survives runs)
+  2. Query telemetry, route_reports, blacklists since then (default: 24h)
+  3. Build CSVs (raw payloads, one row per message, no computation)
+  4. Email them as attachments - no local files kept
+  5. On ANY failure (DB unreachable etc): email the failure instead
 
-The report WINDOW is independent of the schedule: WINDOW_HOURS = how
-much history each report covers.
-
-Usage:
-  python reporter.py --test            tiny SMTP sanity-check email
-  python reporter.py --now --no-email  one report now, saved locally only
-  python reporter.py --now             one report now, emailed too
-  python reporter.py                   start the schedule loop
-
-Windows Task Scheduler alternative to the loop (survives reboots,
-nothing resident): point a Daily task at
-  python reporter.py --now
-with "Start in" set to this folder, and add arguments
-  1>> task.log 2>&1
-to keep a log of unattended runs. Do NOT run the loop and the Task
-Scheduler task at the same time (double emails).
+Failure semantics: the email system is the alert channel. If the
+database is down, the recipient learns it from an email, not silence.
 """
 
-import os
-import sys
-import signal
-import threading
+import csv
 import datetime
+import io
+import json
+import os
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.mime.application import MIMEApplication
 
 from pymongo import MongoClient
 
-# ---------------------------------------------------------------------------
-# CONFIG - everything you change lives in this block, nothing below it
-# ---------------------------------------------------------------------------
+from dotenv import load_dotenv
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"), override=False)
 
-# --- database -------------------------------------------------------------
-DB_URI = "mongodb+srv://test:test@banglacluster.ntnbhcq.mongodb.net/?appName=BanglaCluster"
-DB_NAME = "RiverGuard"
+# --- config (env, injected by compose/bat) ---
+DB_URI = os.getenv("DB_URI", "mongodb://localhost:27017")
+DB_NAME = os.getenv("DB_NAME", "RiverGuard")
+WINDOW_HOURS = int(os.getenv("WINDOW_HOURS", "24"))
 
-# --- where reports are saved ----------------------------------------------
-# Always relative to this file, so it works no matter where you run from.
-# (task.log from Task Scheduler lands here too.)
-REPORTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reports")
+# The last-reported checkpoint: state/last_report.txt next to this file.
+# The container mounts reporter/state as /app/state, so local and
+# container runs share the SAME state file - deliberate.
+STATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state")
+STATE_FILE = os.path.join(STATE_DIR, "last_report.txt")
 
-# --- schedule & window ----------------------------------------------------
-WINDOW_HOURS = 24        # how much history each report covers
-INTERVAL_HOURS = 24      # schedule: every N hours (when DAILY_AT is None)
-DAILY_AT = None          # e.g. "08:00" local time - overrides the schedule
+RECIPIENTS = os.getenv("RECIPIENTS", "").split(",")
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASS = os.getenv("SMTP_PASS", "")
+EMAIL_FROM = os.getenv("EMAIL_FROM", "RiverGuard <noreply@riverguard.local>")
 
-#  recipients (add as many as you like) 
-RECIPIENTS = ["aqib.mohiuddin08@gmail.com", "102782478@students.swinburne.edu.my"]     # <-- YOUR TWO EMAILS
+MAX_BACKLOG_DAYS = 7
 
-#  sending account 
-# The SENDER is one of your emails. The app password is NOT your normal
-# Gmail password:
-#   Google Account -> Security -> 2-Step Verification (must be on) ->
-#   App passwords -> create "RiverGuard" -> 16 characters, no spaces.
-# If SMTP_USER is empty, emailing is disabled: reports still generate
-# and save locally (that's what --no-email does internally).
-SMTP_HOST = "smtp.gmail.com"
-SMTP_PORT = 465          # SSL
-SMTP_USER = "aqib.mohiuddin08@gmail.com"       # <-- sender account
-SMTP_PASS = "zuhrlxowyscwrhfn"     # <-- 16-char app password, no spaces
-EMAIL_FROM = "RiverGuard <aqib.mohiuddin08@gmail.com>"
 
-# ---------------------------------------------------------------------------
-# Nothing below needs changing for normal use
-# ---------------------------------------------------------------------------
 
-stop_event = threading.Event()
+def build_windows(start, end):
+    """Split [start, end) into sequential 24h windows - one email each.
+    Capped at MAX_BACKLOG_DAYS so a deleted state file after months of
+    data does not flood the recipient."""
+    windows = []
+    cur = start
+    while cur < end and len(windows) < MAX_BACKLOG_DAYS:
+        nxt = min(cur + datetime.timedelta(hours=WINDOW_HOURS), end)
+        windows.append((cur, nxt))
+        cur = nxt
+    return windows
 
-def signal_handler(signum, frame):
-    stop_event.set()
+def now():
+    return datetime.datetime.utcnow()
 
-signal.signal(signal.SIGINT, signal_handler)
-signal.signal(signal.SIGTERM, signal_handler)
 
-# ---------------------------------------------------------------------------
-# Collect: query the database for the report window
-# ---------------------------------------------------------------------------
+def read_last_reported():
+    """Start of the reporting window: the last reported timestamp, or
+    (now - WINDOW_HOURS) on first run. Stored on the state volume."""
+    try:
+        with open(STATE_FILE) as f:
+            return datetime.datetime.fromisoformat(f.read().strip())
+    except Exception:
+        return now() - datetime.timedelta(hours=WINDOW_HOURS)
 
-def collect(hours):
-    """Gather everything needed for one report into a plain dict."""
-    db = MongoClient(DB_URI)[DB_NAME]
 
-    now = datetime.datetime.utcnow()
-    start = now - datetime.timedelta(hours=hours)
-    window = {"timestamp": {"$gte": start, "$lt": now}}
+def write_last_reported(ts):
+    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+    with open(STATE_FILE, "w") as f:
+        f.write(ts.isoformat())
 
-    # what HAPPENED in the window
-    alerts = list(db.alerts.find(window).sort("timestamp", 1))
-    events = list(db.events.find(window).sort("timestamp", 1))
-    telemetry_total = db.telemetry.count_documents(window)
 
-    # what the state is RIGHT NOW (not windowed)
-    villages = list(db.villages.find().sort("_id", 1))
-    nodes = list(db.river_nodes.find())
-    stats = db.global_stats.find_one({"_id": "global"}) or {}
+def collect(db, start, end):
+    query = {"timestamp": {"$gte": start, "$lt": end}}
+    telemetry = list(db.telemetry.find(query).sort("timestamp", 1))
+    routes = list(db.route_reports.find(query).sort("timestamp", 1))
+    blacklists = list(db.blacklists.find(query).sort("timestamp", 1))
+    return telemetry, routes, blacklists
 
-    nodes_by_village = {}
-    for n in nodes:
-        nodes_by_village.setdefault(n.get("village_id"), []).append(n)
 
-    # one row per village for the summary table
-    village_rows = []
-    for v in villages:
-        vn = nodes_by_village.get(v["_id"], [])
-        bats = [n.get("bat") for n in vn if n.get("bat") is not None]
-        village_rows.append({
-            "name": v["_id"],
-            "online": bool(v.get("is_online")),
-            "master": v.get("master_id") or "?",
-            "nodes_total": len(vn),
-            "nodes_online": sum(1 for n in vn if n.get("status") == "online"),
-            "max_water": max([n.get("water_level") or 0 for n in vn], default=0),
-            "min_bat": min(bats) if bats else None,
-        })
+def to_csv(rows, fields, payload_fields=None):
+    """rows -> CSV string. payload_fields: keys to flatten out of the
+    payload dict (raw values, no computation)."""
+    out = io.StringIO()
+    w = csv.writer(out)
+    w.writerow(fields + (payload_fields or []))
+    for r in rows:
+        base = [r.get(f, "") for f in fields]
+        if payload_fields:
+            p = r.get("payload") or {}
+            base += [p.get(k, "") for k in payload_fields]
+        ts = r.get("timestamp")
+        base[fields.index("timestamp")] = ts.isoformat() if ts else ""
+        w.writerow(base)
+    return out.getvalue()
 
-    def tally(docs, key):
-        out = {}
-        for d in docs:
-            k = d.get(key, "unknown")
-            out[k] = out.get(k, 0) + 1
-        return out
 
-    return {
-        "generated_at": now,
-        "window_start": start,
-        "window_hours": hours,
-        "village_rows": village_rows,
-        "alerts": alerts,
-        "alert_counts": tally(alerts, "type"),
-        "event_counts": tally(events, "event_type"),
-        "telemetry_total": telemetry_total,
-        "stats": stats,
-    }
+def build_csvs(telemetry, routes, blacklists):
+    """The three attachments: raw message data, no computation."""
+    t_csv = to_csv(telemetry,
+        ["node_id", "timestamp"],
+        ["node", "uptime_minute", "sequence", "tx_packets", "rx_packets",
+         "tx_bytes", "rx_bytes", "sf"])
+    r_csv = to_csv(routes,
+        ["node_id", "timestamp"],
+        ["s", "g"])   # routes are big; the payload JSON is the honest form
+    b_csv = to_csv(blacklists,
+        ["v", "sequence", "edges", "timestamp"])
 
-# ---------------------------------------------------------------------------
-# Render: HTML (email) + plain text (fallback)
-# ---------------------------------------------------------------------------
+    # route payloads contain nested route lists - attach the raw JSON as
+    # a column so nothing is lost (raw, as specified)
+    out = io.StringIO()
+    w = csv.writer(out)
+    w.writerow(["node_id", "timestamp", "raw_payload"])
+    for r in routes:
+        ts = r.get("timestamp")
+        w.writerow([r.get("node_id", ""),
+                    ts.isoformat() if ts else "",
+                    json.dumps(r.get("payload"))])
+    return [("telemetry.csv", t_csv),
+            ("route_reports.csv", out.getvalue()),
+            ("blacklists.csv", b_csv)]
 
-LEVEL_COLORS = {0: "#2e7d32", 1: "#f9a825", 2: "#ef6c00", 3: "#c62828"}
 
-def render_html(d):
-    """Email-safe HTML: everything inline, no external assets."""
-    w = d["window_start"].strftime("%d %b %Y %H:%M") + " UTC"
-    g = d["generated_at"].strftime("%d %b %Y %H:%M") + " UTC"
-
-    # --- per-village current state table ---
-  # --- per-village current state table ---
-    vrows = ""
-    for v in d["village_rows"]:
-        bat = f"{v['min_bat']:.1f} V" if v["min_bat"] is not None else "—"
-        color = LEVEL_COLORS.get(v["max_water"], "#999")
-
-        # Built BEFORE the f-string: Pythons before 3.12 forbid backslashes
-        # (and same-quote tricks) inside the {expression} part of an
-        # f-string. A plain variable sidesteps that and keeps the table
-        # template below easy to read.
-        if v["online"]:
-            status = "online"
-        else:
-            status = '<b style="color:#c62828">OFFLINE</b>'
-
-        vrows += (
-            f"<tr>"
-            f"<td style='padding:6px 10px;border-bottom:1px solid #ddd'><b>{v['name']}</b></td>"
-            f"<td style='padding:6px 10px;border-bottom:1px solid #ddd'>{status}</td>"
-            f"<td style='padding:6px 10px;border-bottom:1px solid #ddd'>{v['nodes_online']}/{v['nodes_total']}</td>"
-            f"<td style='padding:6px 10px;border-bottom:1px solid #ddd'>"
-            f"<span style='color:#fff;background:{color};padding:1px 8px;border-radius:8px'>{v['max_water']} ft</span></td>"
-            f"<td style='padding:6px 10px;border-bottom:1px solid #ddd'>{bat}</td>"
-            f"</tr>"
-        )
-
-    # --- flood alerts in window, newest last, max 20 rows ---
-    arows = ""
-    flood_alerts = [a for a in d["alerts"] if a.get("type") == "flood"]
-    for a in flood_alerts[-20:]:
-        t = a["timestamp"].strftime("%d %b %H:%M")
-        arows += (
-            f"<tr><td style='padding:4px 10px'>{t}</td>"
-            f"<td style='padding:4px 10px'><b>{a.get('node_id')}</b> ({a.get('village_id')})</td>"
-            f"<td style='padding:4px 10px;color:#c62828'>water at {a.get('value')} ft</td></tr>"
-        )
-    if not arows:
-        arows = "<tr><td colspan=3 style='padding:4px 10px;color:#777'>No flood alerts in this window.</td></tr>"
-
-    ac = d["alert_counts"]
-    ac_line = ", ".join(f"{k}: {v}" for k, v in sorted(ac.items())) or "none"
-    ec = d["event_counts"]
-    ec_line = ", ".join(f"{k}: {v}" for k, v in sorted(ec.items())) or "none"
-    s = d["stats"]
-
-    return f"""
-    <div style="font-family:Arial,sans-serif;color:#222;max-width:640px">
-      <div style="background:#14324f;color:#fff;padding:14px 18px;border-radius:8px 8px 0 0">
-        <h2 style="margin:0">RiverGuard Flood Monitoring Report</h2>
-        <div style="opacity:.8;font-size:12px">Window: {w} &rarr; {g}</div>
-      </div>
-
-      <h3 style="margin:18px 0 6px">Village status (current)</h3>
-      <table style="border-collapse:collapse;font-size:14px;width:100%">
-        <tr style="color:#5b6b7b;font-size:12px;text-align:left">
-          <th style="padding:6px 10px">Village</th><th style="padding:6px 10px">Master</th>
-          <th style="padding:6px 10px">Nodes up</th><th style="padding:6px 10px">Max water</th>
-          <th style="padding:6px 10px">Min batt.</th></tr>
-        {vrows}
-      </table>
-
-      <h3 style="margin:18px 0 6px">Flood alerts in window</h3>
-      <table style="border-collapse:collapse;font-size:14px;width:100%">{arows}</table>
-
-      <h3 style="margin:18px 0 6px">Summary</h3>
-      <ul style="font-size:13px;line-height:1.7">
-        <li>Alerts: {ac_line}</li>
-        <li>Node/master events: {ec_line}</li>
-        <li>Telemetry updates stored: {d['telemetry_total']}</li>
-        <li>System now: {s.get('masters_online', 0)} master(s) online,
-            {s.get('river_nodes_online', 0)}/{s.get('river_nodes_online', 0) + s.get('river_nodes_offline', 0)} nodes online</li>
-      </ul>
-
-      <div style="margin-top:18px;padding-top:10px;border-top:1px solid #ddd;
-                  font-size:11px;color:#888">Automated report from the RiverGuard IoT system.</div>
-    </div>"""
-
-def render_text(d):
-    """Plain-text alternative (some clients/users prefer it)."""
-    lines = ["RiverGuard Flood Monitoring Report",
-             f"Window: {d['window_start']} -> {d['generated_at']} UTC", ""]
-    for v in d["village_rows"]:
-        lines.append(f"{v['name']}: {'online' if v['online'] else 'OFFLINE'}, "
-                     f"{v['nodes_online']}/{v['nodes_total']} nodes, "
-                     f"max water {v['max_water']} ft")
-    lines.append("")
-    lines.append(f"Alerts: {d['alert_counts'] or 'none'}")
-    lines.append(f"Events: {d['event_counts'] or 'none'}")
-    return "\n".join(lines)
-
-# ---------------------------------------------------------------------------
-# Save + send
-# ---------------------------------------------------------------------------
-
-def send_email(subject, html, text):
-    """Send one email to all RECIPIENTS. Silently skips if not configured."""
-    if not SMTP_USER:
-        print("[email] SMTP not configured - report saved locally only")
+def send(subject, body, csvs=None):
+    """Send one email; csvs is [(filename, content), ...]. No-op-ish on
+    missing config (failure emails will state it)."""
+    if not SMTP_USER or not RECIPIENTS or RECIPIENTS == [""]:
+        print("[reporter] email not configured - printing instead")
+        print(subject); print(body)
         return
-    msg = MIMEMultipart("alternative")
+
+    msg = MIMEMultipart()
     msg["Subject"] = subject
     msg["From"] = EMAIL_FROM
     msg["To"] = ", ".join(RECIPIENTS)
-    msg.attach(MIMEText(text, "plain"))
-    msg.attach(MIMEText(html, "html"))
+    msg.attach(MIMEText(body, "plain"))
+    for fname, content in csvs or []:
+        part = MIMEApplication(content.encode("utf-8"), Name=fname)
+        part["Content-Disposition"] = f'attachment; filename="{fname}"'
+        msg.attach(part)
 
+    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as s:
+        s.login(SMTP_USER, SMTP_PASS)
+        s.sendmail(SMTP_USER, RECIPIENTS, msg.as_string())
+        
+def connect_or_fail():
+    """Connect to the database or send the failure email and exit 1."""
     try:
-        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as server:
-            server.login(SMTP_USER, SMTP_PASS)
-            server.sendmail(SMTP_USER, RECIPIENTS, msg.as_string())
-        print(f"[email] sent to {len(RECIPIENTS)} recipient(s): {subject}")
+        db = MongoClient(DB_URI, serverSelectionTimeoutMS=10000)[DB_NAME]
+        db.command("ping")
+        return db
     except Exception as e:
-        print(f"[email] FAILED (report still saved locally): {e}")
-
-def send_test_email():
-    """Tiny email to verify SMTP settings before running a real report.
-    If this arrives but a report doesn't, the problem is the report.
-    If neither arrives, the problem is SMTP settings or the network
-    (campus/work networks sometimes block port 465 - try home Wi-Fi)."""
-    if not SMTP_USER:
-        print("[email] set SMTP_USER/SMTP_PASS first")
-        return
-    try:
-        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as server:
-            server.login(SMTP_USER, SMTP_PASS)
-            server.sendmail(SMTP_USER, RECIPIENTS,
-                "Subject: RiverGuard SMTP test\n\n"
-                "If you can read this in both inboxes, email sending works.")
-        print(f"[email] test sent to {len(RECIPIENTS)} recipient(s)")
-    except Exception as e:
-        print(f"[email] test FAILED: {e}")
-
-def run_report(hours, email=True):
-    """One report: collect -> render -> save to disk -> (optionally) email."""
-    d = collect(hours)
-    html, text = render_html(d), render_text(d)
-
-    os.makedirs(REPORTS_DIR, exist_ok=True)
-    fname = os.path.join(REPORTS_DIR,
-        f"report_{d['generated_at'].strftime('%Y%m%d_%H%M%S')}.html")
-    with open(fname, "w", encoding="utf-8") as f:
-        f.write(html)
-    print(f"[report] saved {fname}")
-
-    if email:
-        floods = d["alert_counts"].get("flood", 0)
-        marker = f" [FLOOD x{floods}]" if floods else ""
-        subject = (f"RiverGuard report "
-                   f"{d['generated_at'].strftime('%d %b %H:%M')} UTC{marker} "
-                   f"({len(d['alerts'])} alerts)")
-        send_email(subject, html, text)
-
-# ---------------------------------------------------------------------------
-# Scheduling
-# ---------------------------------------------------------------------------
-
-def next_run_time():
-    """When the next scheduled report happens (local clock)."""
-    if DAILY_AT:
-        hh, mm = map(int, DAILY_AT.split(":"))
-        now = datetime.datetime.now()
-        candidate = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
-        if candidate <= now:
-            candidate += datetime.timedelta(days=1)
-        return candidate
-    return datetime.datetime.now() + datetime.timedelta(hours=INTERVAL_HOURS)
+        send(f"[RiverGuard] Report FAILED - database unreachable",
+             f"The daily report could not run.\n\nError: {e}\n"
+             f"Time: {now().isoformat()} UTC\n\n"
+             f"Check: is the compose stack running? (docker ps)")
+        raise SystemExit(1)
 
 def main():
-    if "--test" in sys.argv:
-        send_test_email()
-        return
-    if "--now" in sys.argv:
-        run_report(WINDOW_HOURS, email="--no-email" not in sys.argv)
-        return
+    db = connect_or_fail()
 
-    print(f"[reporter] schedule: every {INTERVAL_HOURS}h"
-          + (f" / daily at {DAILY_AT}" if DAILY_AT else "")
-          + f", window {WINDOW_HOURS}h, reports -> {REPORTS_DIR}")
-    while not stop_event.is_set():
-        target = next_run_time()
-        print(f"[reporter] next report at {target}")
-        while not stop_event.is_set() and datetime.datetime.now() < target:
-            stop_event.wait(1.0)
-        if stop_event.is_set():
-            break
-        try:
-            run_report(WINDOW_HOURS, email=True)
-        except Exception as e:
-            print(f"[reporter] report run failed (will retry next schedule): {e}")
+    start = read_last_reported()
+    end = now()
+    windows = build_windows(start, end)
 
-    print("[reporter] shut down")
+    try:
+        for w_start, w_end in windows:
+            telemetry, routes, blacklists = collect(db, w_start, w_end)
+            csvs = build_csvs(telemetry, routes, blacklists)
+            body = (f"RiverGuard daily report\n"
+                    f"Window: {w_start.isoformat()} -> {w_end.isoformat()} UTC\n"
+                    f"Messages: {len(telemetry)} telemetry, {len(routes)} route "
+                    f"reports, {len(blacklists)} blacklist versions.\n")
+            send(f"[RiverGuard] Report {w_start.date()} - "
+                 f"{len(telemetry)+len(routes)+len(blacklists)} messages",
+                 body, csvs)
+            write_last_reported(w_end)   # advance per window - partial progress survives
+    except Exception as e:
+        # SMTP unreachable (campus internet down, etc.) - the state is
+        # NOT advanced, so the next successful run re-reports this window.
+        print(f"[reporter] send failed: {e}")
+        print("[reporter] state not advanced - will retry next scheduled run.")
+        raise SystemExit(2)   # distinct from DB failure's exit 1
+
+    if start + datetime.timedelta(days=MAX_BACKLOG_DAYS) < end:
+        send("[RiverGuard] Report backlog truncated",
+             f"More than {MAX_BACKLOG_DAYS} days of backlog existed; only the "
+             f"most recent were reported. State has been advanced to now.")
+
 
 if __name__ == "__main__":
     main()

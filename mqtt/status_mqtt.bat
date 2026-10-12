@@ -1,7 +1,9 @@
 @echo off
-REM RiverGuard - is the broker container running?
+REM RiverGuard - MQTT broker container (any mode: standalone or compose,
+REM both named 'riverguard-eclipse'), plus the shared network state.
 
-docker ps --filter "name=eclipse" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+docker ps -a --filter "name=riverguard-eclipse" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
 echo.
-echo (if 'eclipse' is not listed above, it is stopped)
-pause
+docker network ls --filter "name=riverguard-docker-network" --format "network: {{.Name}}"
+echo.
+echo Not listed = not created. "Exited" = created but stopped.

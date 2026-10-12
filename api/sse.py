@@ -24,12 +24,13 @@ from fastapi.responses import StreamingResponse
 
 import config
 import state
+import logger
 
 router = APIRouter()
 
-"""Live feed of everything the parser publishes to Redis."""
 @router.get("/stream")
 async def stream(request: Request):
+    """Live feed of everything the parser publishes to Redis."""
     if state.state["redis"] is None:
         raise HTTPException(
             status_code=503,
@@ -45,14 +46,14 @@ async def stream(request: Request):
         },
     )
 
-"""
-Yields SSE events forever. One generator runs per connected browser.
-
-When the browser disconnects, Starlette cancels this generator, which
-lands in the finally-block below - so the Redis subscription is always
-cleaned up and connections never leak.
-"""
 async def event_generator(request):
+    """
+    Yields SSE events forever. One generator runs per connected browser.
+
+    When the browser disconnects, Starlette cancels this generator, which
+    lands in the finally-block below - so the Redis subscription is always
+    cleaned up and connections never leak.
+    """
     pubsub = state.state["redis"].pubsub()
     await pubsub.psubscribe("riverguard:*")
 
@@ -96,7 +97,7 @@ async def event_generator(request):
                 last_keepalive = time.monotonic()
                 
             if await request.is_disconnected():
-                print("[stream] client disconnected - closing stream")
+                logger.log_error("stream", "client disconnected - closing")
                 return
 
     finally:

@@ -1,27 +1,21 @@
 @echo off
-REM RiverGuard - start Redis and Redis Insight.
-REM Pattern: start the container if it exists; create it (pulling the
-REM image if needed) only when it doesn't. Works on a fresh machine AND
-REM on a machine where the containers already exist - same command.
+REM RiverGuard - start the Redis server (Docker container), standalone.
+REM Joins the shared network (same one compose uses), so containerized
+REM services can reach it by service name whether it was started here
+REM or by compose. Also publishes localhost:6379 for python-run services.
+REM Not part of the compose stack - alternative mode, one at a time.
 
-echo [redis] Starting Redis...
+REM --- the shared network (no-op if it exists; compose creates it too) ---
+docker network create riverguard-docker-network 2>nul
 
-docker start redis 2>nul
-if errorlevel 1 (
-    echo [redis] Container not found - creating it (pulls image if needed)...
-    docker run -d --name redis -p 6379:6379 redis:alpine
-)
+docker start riverguard-redis >nul 2>&1
+if not errorlevel 1 goto ok
 
-echo [redis] Starting Redis Insight...
+echo [redis] Creating the container...
+docker run -d --name riverguard-redis --restart unless-stopped ^
+    --network riverguard-docker-network ^
+    -p 6379:6379 ^
+    redis:alpine || (echo [redis] failed to create. & pause & exit /b 1)
 
-docker start redis-insight 2>nul
-if errorlevel 1 (
-    echo [redis-insight] Container not found - creating it (pulls image if needed)...
-    docker run -d --name redis-insight -p 5540:5540 redis/redisinsight:latest
-)
-
-echo.
-echo [redis] Redis         : localhost:6379
-echo [redis] Redis Insight : http://localhost:5540
-echo.
-pause
+:ok
+echo [redis] running. localhost:6379 (host) / redis:6379 (network)

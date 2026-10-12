@@ -1,7 +1,9 @@
 @echo off
-REM RiverGuard - are the Redis containers running?
+REM RiverGuard - Redis containers (any mode: standalone 'redis' or
+REM compose 'riverguard-redis'), plus the shared network state.
 
-docker ps --filter "name=redis" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+docker ps -a --filter "name=redis" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
 echo.
-echo (only 'redis' and 'redis-insight' matter here - if they are not listed, they are stopped)
-pause
+docker network ls --filter "name=riverguard-docker-network" --format "network: {{.Name}}"
+echo.
+echo Not listed = not created. "Exited" = created but stopped.

@@ -17,3 +17,10 @@ mermtry.md
 mqtt/data/*
 mqtt/log/*
 mongo/data/*
+/archive
+*/.env.docker
+*/file_dump.py
+*/#file_dump.py
+reporter/state/
+parser/logs/
+api/logs/

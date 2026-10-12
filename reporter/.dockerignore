@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.env
+.env.docker
+state/
+0file_dump.py
