@@ -3,7 +3,8 @@ REM RiverGuard - start the MQTT broker (Eclipse Mosquitto), standalone.
 REM Joins the shared network (same one compose uses), so containerized
 REM services reach it as 'riverguard-eclipse' whether started here or
 REM by compose. Also publishes localhost:1883 for python-run services
-REM and ESP32s. Not part of the compose stack - alternative mode.
+REM and ESP32s. Alternative mode - one mode at a time (ports conflict).
+REM Labeled as part of the riverguard compose project (groups in UI).
 
 REM --- the shared network (no-op if it exists; compose creates it too) ---
 docker network create riverguard-docker-network 2>nul
@@ -14,6 +15,8 @@ if not errorlevel 1 goto ok
 echo [mqtt] Creating the container...
 docker run -d --name riverguard-eclipse --restart unless-stopped ^
     --network riverguard-docker-network ^
+    --label com.docker.compose.project=riverguard ^
+    --label com.docker.compose.service=riverguard-eclipse ^
     -p 1883:1883 ^
     -v "%~dp0conf:/mosquitto/config" ^
     -v "%~dp0data:/mosquitto/data" ^

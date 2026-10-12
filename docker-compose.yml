@@ -8,7 +8,7 @@ networks:
 
 services:
 
-  mosquitto:
+  riverguard-eclipse:
     image: eclipse-mosquitto:latest
     container_name: riverguard-eclipse
     restart: unless-stopped
@@ -48,7 +48,7 @@ services:
     volumes:
       - ./parser/logs:/app/logs
     depends_on:
-      - mosquitto
+      -  riverguard-eclipse
       - mongo
       - redis
     networks: [riverguard]
