@@ -78,7 +78,6 @@ immediately; the parser dedups on `v`+`sequence`).
 | `v` | **format version** — payload shape; changes when fields change |
 | `sequence` | **edit counter** — monotonic per station; the ordering key |
 | `edges` | node pairs whose direct link is disabled |
-| `reason` | v2 field — why (absent in v1 history) |
 
 The v/sequence distinction: `sequence` says which policy is newer;
 `v` says which payload *shape* a given policy uses.

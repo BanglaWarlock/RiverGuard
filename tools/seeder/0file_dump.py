@@ -5,7 +5,7 @@ root_dir = "."
 
 # Folders and file extensions/names to exclude
 exclude_dirs = {"__pycache__", "web", "stress"}
-exclude_files = {"style.css"}  # Add files you want to skip reading/showing
+exclude_files = {"style.css", "scenario.json", "scenario_preview.html"}  # Add files you want to skip reading/showing
 excluded_extensions = {}  # Extensions to not read content from
 
 for current_root, dirs, files in os.walk(root_dir):

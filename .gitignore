@@ -24,3 +24,5 @@ mongo/data/*
 reporter/state/
 parser/logs/
 api/logs/
+tools/seeder/scenario_preview.html
+tools/seeder/scenario.json
