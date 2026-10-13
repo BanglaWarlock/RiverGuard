@@ -52,6 +52,9 @@ PER_NODE_DEFAULT = 10
 ASYM_DB = 3.0     # per-direction baseline offset (dB) - link asymmetry
 ASYM_SNR = 0.8    # per-direction baseline offset (dB)
 
+REPORT_MINUTES_DEFAULT = 10   # one route report per node per hour
+
+
 # --- time helpers ---
 
 def day_start(day):
@@ -110,24 +113,17 @@ def blacklist_on(timeline, day):
 
 # --- seeding ---
 
-def seed(db, scenario, days, per_node, edge_min):
-    """The ONE orchestration path (main calls this and nothing else)."""
+def seed(db, scenario, days, per_node, report_min):
+    """The ONE orchestration path. Route reports are the dense stream:
+    one per node per report_min, each computed from that moment's
+    directional link qualities. There is no separate edge stream."""
     timeline = [e for e in scenario.get("blacklist_timeline", [])
                 if e["day"] <= days]
 
     for island in scenario["islands"]:
-        # 1. dense edge series (writes telemetry; returns the history
-        #    so route reports use the SAME numbers that were stored)
-        edge_history = seed_edge_telemetry(db, island, days, edge_min)
-
-        # 2. sparse node telemetry (parser-shaped payloads)
+        last_reports = seed_routes(db, island, days, timeline, report_min)
         seed_node_telemetry(db, island, days, per_node)
-
-        # 3. routes: one per node per day, from the day's final samples
-        seed_routes(db, island, days, edge_history, timeline)
-
-        # 4. mesh_nodes: final snapshots
-        seed_mesh_nodes(db, island, edge_history)
+        seed_mesh_nodes(db, island, last_reports)
         print(f"[seed] {island['name']}: done")
 
     seed_blacklists(db, scenario, days)
@@ -223,92 +219,100 @@ def seed_node_telemetry(db, island, days, per_node):
             upsert=True)
 
 
-def seed_routes(db, island, days, edge_history, timeline):
+def seed_routes(db, island, days, timeline, report_min):
     """
-    ONE route report per node per day, computed from the day's FINAL
-    directional samples. Routing convention (NODE-KNOWLEDGE MODEL):
-    the cost of a hop X -> Y is X's own measurement of Y - each node
-    routes on what it hears, and the report's first-hop ri/sn is the
-    node's own view of its next hop. (True-delivery model - cost X -> Y
-    is Y's view of X - is the one-line alternative noted below.)
+    The dense stream, in the contract's own message: one route report
+    per node per report_min, computed from a live directional quality
+    walk (shared per-edge degradation, per-direction baselines/jitter
+    - the same model as before, just carried by route reports now).
+    Every ri/sn in every report is a real sample of that link at that
+    moment. RETURNS each node's final report, for mesh_nodes.
+
+    Routing convention (unchanged): the cost of hop X->Y is X's own
+    measurement of Y - each node routes on what it hears.
     """
+    edge_state, dir_state = {}, {}
+    links = island["links"]
+    nodes = island["nodes"] + [island["station"]]
+    steps_per_day = (24 * 60) // report_min
+    chance = DEGRADE_CHANCE / steps_per_day
+    topo_seq = {nid: 0 for nid in nodes}
+    boot_ms = {nid: random.randint(0, 90) * 60000 for nid in nodes}  # per-node boot offset
+    last_reports = {}
+    batch = []
+
     for day in range(days, 0, -1):
-        last = edge_history[day]
         banned = {frozenset(e) for e in blacklist_on(timeline, day)}
+        for step in range(steps_per_day):
+            ts = ts_in_day(day, step * report_min + report_min // 2)
+            uptime_ms = int((ts - day_start(days)).total_seconds() * 1000)
 
-        # DIRECTIONAL adjacency: adj[x] holds x's view of each neighbor
-        adj = {}
-        for l in island["links"]:
-            if frozenset((l["a"], l["b"])) in banned:
-                continue
-            a, b = l["a"], l["b"]
-            rssi_a, snr_a, cost_a = last[f"{a}>{b}"]   # a's view of b
-            rssi_b, snr_b, cost_b = last[f"{b}>{a}"]   # b's view of a
-            adj.setdefault(a, []).append((b, cost_a, rssi_a, snr_a))
-            adj.setdefault(b, []).append((a, cost_b, rssi_b, snr_b))
-            # true-delivery model instead:
-            #   adj[a].append((b, cost_b, ...)) - hop a->b costed by
-            #   how b hears a - swap the cost/quality tuples above.
+            # directional adjacency from THIS step's samples
+            adj = {}
+            for l in links:
+                if frozenset((l["a"], l["b"])) in banned:
+                    continue
+                both = step_edge(l, edge_state, dir_state, chance, report_min)
+                a, b = l["a"], l["b"]
+                rssi_a, snr_a = both[f"{a}>{b}"]   # a's view of b
+                rssi_b, snr_b = both[f"{b}>{a}"]   # b's view of a
+                adj.setdefault(a, []).append(
+                    (b, cost_from(rssi_a, snr_a), rssi_a, snr_a))
+                adj.setdefault(b, []).append(
+                    (a, cost_from(rssi_b, snr_b), rssi_b, snr_b))
 
-        for node_id in island["nodes"] + [island["station"]]:
-            routes = dijkstra(adj, node_id)   # works on directed adj
-            table = []
-            for dest, info in routes.items():
-                first_hop = info["next_hop"]
-                # the node's OWN view of its next hop (matches adj above)
-                link = next((li for li in adj.get(node_id, [])
-                             if li[0] == first_hop), None)
-                table.append({
-                    "d": dest, "n": first_hop, "h": info["hops"],
-                    "c": info["cost"], "l": link[1] if link else None,
-                    "ri": link[2] if link else None,
-                    "sn": link[3] if link else None,
-                    "p": ">".join(info["path"]),
-                    "a": random.randint(400, 3000),
-                    "q": random.randint(10, 50),
-                })
-            db.route_reports.insert_one({
-                "node_id": node_id,
-                "payload": {
-                    "s": (days - day + 1) * 10 + 3,
-                    "g": (days - day + 1) * 14400000,
-                    "r": table,
-                },
-                "timestamp": ts_in_day(day, 24 * 60 - 1),
-            })
+            for node_id in nodes:
+                topo_seq[node_id] += 1
+                routes = dijkstra(adj, node_id)
+                table = []
+                for dest, info in routes.items():
+                    first_hop = info["next_hop"]
+                    link = next((li for li in adj.get(node_id, [])
+                                 if li[0] == first_hop), None)
+                    table.append({
+                        "d": dest, "n": first_hop, "h": info["hops"],
+                        "c": info["cost"], "l": link[1] if link else None,
+                        "ri": link[2] if link else None,
+                        "sn": link[3] if link else None,
+                        "p": ">".join(info["path"]),
+                        "a": random.randint(400, 3000),
+                        "q": random.randint(10, 50),
+                    })
+                report = {
+                    "node_id": node_id,
+                    "payload": {"s": topo_seq[node_id],
+                                "g": uptime_ms + boot_ms[node_id],
+                                "r": table},
+                    "timestamp": ts,
+                }
+                batch.append(report)
+                last_reports[node_id] = report   # later steps overwrite
 
+        db.route_reports.insert_many(batch)
+        batch = []
 
-def seed_mesh_nodes(db, island, edge_history):
-    """Final mesh_nodes snapshots: same field set the parser writes."""
-    last = edge_history[1]
-    node_ids = island["nodes"] + [island["station"]]
+    return last_reports
 
-    neighbors = {nid: [] for nid in node_ids}
-    for l in island["links"]:
-        neighbors[l["a"]].append(l["b"])
-        neighbors[l["b"]].append(l["a"])
-
-    for node_id in node_ids:
-        # first-hop quality: one of THIS node's own edges (not the
-        # island's first link - the old code read the wrong edge and
-        # most nodes got None)
-        link = next((l for l in island["links"]
-                     if l["a"] == node_id or l["b"] == node_id), None)
-        rssi = snr = None
-        if link:
-            other = link["b"] if link["a"] == node_id else link["a"]
-            rssi, snr, _ = last[f"{node_id}>{other}"]   # node's own view
-
+def seed_mesh_nodes(db, island, last_reports):
+    """Final snapshots - replicating the PARSER's own logic
+    (upsert_mesh_node_from_route): topology_seq from s, link_count
+    from the table, first-hop quality from the first non-null ri.
+    Seeded and real mesh_nodes docs are indistinguishable."""
+    for node_id, report in last_reports.items():
+        p = report["payload"]
+        routes = p.get("r", [])
+        first_hop = next((r for r in routes if r.get("ri") is not None), None)
         db.mesh_nodes.update_one(
             {"node_id": node_id},
             {"$set": {
-                "last_seen": ts_in_day(1, 24 * 60 - 1),   # = route report ts
-                "link_count": len(neighbors[node_id]),
-                "first_hop_rssi": rssi, "first_hop_snr": snr,
-                "topology_seq": 10 * len(edge_history) + 3,  # = day-1 route "s"
+                "last_seen": report["timestamp"],
+                "topology_seq": p.get("s"),
+                "link_count": len(routes),
+                "first_hop_rssi": first_hop.get("ri") if first_hop else None,
+                "first_hop_snr": first_hop.get("sn") if first_hop else None,
             },
              "$setOnInsert": {"node_id": node_id,
-                              "first_seen": day_start(len(edge_history))}},
+                              "first_seen": report["timestamp"]}},
             upsert=True)
 
 

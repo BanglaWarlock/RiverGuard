@@ -38,6 +38,14 @@ from email.mime.application import MIMEApplication
 from pymongo import MongoClient
 
 from dotenv import load_dotenv
+import zipfile 
+
+# Zip the whole attachment bundle past this size. Gmail's 25 MB cap is
+# on the ENCODED message - base64 inflates attachments ~33%, so ~18 MB
+# raw is the real ceiling. Below it, plain CSVs (no extra work for the
+# recipient); above it, one zip (opens natively in Windows Explorer).
+ATTACH_ZIP_THRESHOLD = 18 * 1024 * 1024
+
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"), override=False)
 
 # --- config (env, injected by compose/bat) ---
@@ -60,20 +68,16 @@ EMAIL_FROM = os.getenv("EMAIL_FROM", "RiverGuard <noreply@riverguard.local>")
 
 MAX_BACKLOG_DAYS = 7
 
-
 def build_windows(start, end):
-    """Complete WINDOW_HOURS windows in [start, end), oldest first.
-    The trailing PARTIAL window is excluded on purpose: state is only
-    advanced over full windows, so the remainder is picked up by the
-    next scheduled run. Capped at MAX_BACKLOG_DAYS so a deleted state
-    file after months of data does not flood the recipient."""
     windows = []
     cur = start
     full = datetime.timedelta(hours=WINDOW_HOURS)
-    while cur + full <= end and len(windows) < MAX_BACKLOG_DAYS:
+    while len(windows) < MAX_BACKLOG_DAYS:
+        if cur + full > end:
+            return windows, False      # ran out of complete windows - not truncation
         windows.append((cur, cur + full))
         cur += full
-    return windows
+    return windows, (cur + full <= end)   # capped AND more full days remained
 
 def now():
     return datetime.datetime.utcnow()
@@ -81,12 +85,21 @@ def now():
 
 def read_last_reported():
     """Start of the reporting window: the last reported timestamp, or
-    (now - WINDOW_HOURS) on first run. Stored on the state volume."""
+    UTC midnight MAX_BACKLOG_DAYS ago on first run.
+
+    First-run default is deliberately NOT 'now - 24h': that would
+    silently skip everything older than a day. Anchoring at the oldest
+    reportable day means a fresh install (new PC, restored database)
+    catches up over the last week in full-day windows - the same
+    catch-up path an outage uses. Data older than MAX_BACKLOG_DAYS is
+    out of scope by design: a fresh install must not attempt years of
+    backlog."""
     try:
         with open(STATE_FILE) as f:
             return datetime.datetime.fromisoformat(f.read().strip())
     except Exception:
-        return now() - datetime.timedelta(hours=WINDOW_HOURS)
+        base = now() - datetime.timedelta(days=MAX_BACKLOG_DAYS)
+        return base.replace(hour=0, minute=0, second=0, microsecond=0)
 
 
 def write_last_reported(ts):
@@ -97,10 +110,10 @@ def write_last_reported(ts):
 
 def collect(db, start, end):
     window = {"timestamp": {"$gte": start, "$lt": end}}
-    # NODE telemetry only: the contract's verbatim-payload rows. The
-    # telemetry collection may also hold the seeder's dense edge-quality
-    # stream (param/value rows, ~100k/day) - that is analysis data,
-    # not node messages; including it would flood the CSVs.
+    # telemetry rows are contract-shaped (verbatim payload). The
+    # payload filter is kept as defense: databases seeded by the OLD
+    # seeder may still hold param/value edge rows, which are not node
+    # messages and must not reach the CSVs.
     telemetry = list(db.telemetry.find(
         {**window, "payload": {"$exists": True}}).sort("timestamp", 1))
     routes = list(db.route_reports.find(window).sort("timestamp", 1))
@@ -169,9 +182,24 @@ def send(subject, body, csvs=None):
     msg["Subject"] = subject
     msg["From"] = EMAIL_FROM
     msg["To"] = ", ".join(RECIPIENTS)
-    msg.attach(MIMEText(body, "plain"))
-    for fname, content in csvs or []:
-        part = MIMEApplication(content.encode("utf-8"), Name=fname)
+        msg.attach(MIMEText(body, "plain"))
+
+    # attachments: small days = plain CSVs; big days (dense route
+    # reports) = ONE zip - double-click to open, no tools needed
+    csvs = csvs or []
+    total = sum(len(c.encode("utf-8")) for _, c in csvs)
+    if total > ATTACH_ZIP_THRESHOLD:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            for fname, content in csvs:
+                z.writestr(fname, content)
+        attachments = [("report.zip", buf.getvalue())]
+        body += "\nAttachments are zipped (large day) - double-click to open."
+    else:
+        attachments = [(f, c.encode("utf-8")) for f, c in csvs]
+
+    for fname, data in attachments:
+        part = MIMEApplication(data, Name=fname)
         part["Content-Disposition"] = f'attachment; filename="{fname}"'
         msg.attach(part)
 
@@ -202,7 +230,7 @@ def main():
 
     start = read_last_reported()
     end = now()
-    windows = build_windows(start, end)
+    windows, truncated = build_windows(start, end)
 
     if not windows:
         # Less than a full window since the last report (Task Scheduler
@@ -211,9 +239,6 @@ def main():
         print(f"[reporter] no complete {WINDOW_HOURS}h window yet "
               f"(last report: {start.isoformat()} UTC) - nothing to do.")
         return
-
-    truncated = (start + datetime.timedelta(days=MAX_BACKLOG_DAYS) < end
-                 and len(windows) == MAX_BACKLOG_DAYS)
 
     sent_any = False
     try:

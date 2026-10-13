@@ -1,226 +1,100 @@
 """
-RiverGuard simulator - one THREAD per node, one MQTT CLIENT per node.
+RiverGuard database reset - drops the ENTIRE RiverGuard database.
 
-ALWAYS FAST (demo/testing cadence): something happens every few
-seconds. Real-time cadence was removed - history belongs to seed_db.py;
-this is a LIVE demo on top.
+Stops the parser first (no mid-clear writes; it recreates the indexes
+on restart), drops the database, unsets the broker's retained
+blacklist (or the old policy resurrects when the parser resubscribes),
+then restarts the parser.
 
-Scenario-based: nodes, links, and route tables come from scenario.json
-(the shared world - the same one seed_db seeds history for), computed
-with real Dijkstra.
+The API is NOT restarted - it reads the database per-request, so the
+website shows the empty state on its next refresh automatically.
 
-Every node is an independent MQTT client with its own connection -
-node behavior is genuinely parallel, a dead thread is a dead node.
-
-Per run, two random non-station nodes get a story:
-  - a STRUGGLER: SF climbs 7 -> 12 over time (the "weak link" node)
-  - a QUIET one: goes silent after ~2 minutes (the "stale node" story)
-
-Contract-compliant publishing (docs/MQTT_MESSAGES.md):
-  telemetry QoS 1, routes QoS 0, blacklist QoS 0 RETAINED.
-
-Usage:
-  python simulator.py
-  python simulator.py --broker tay.suts.internal
-
-Ctrl+C stops all threads cleanly.
+Usage: python clear_db.py          (asks 'yes' first)
+       python clear_db.py --yes    (no prompt - for scripts/bats)
 """
 
-import json
-import os
-import random
-import signal
+import subprocess
 import sys
-import threading
-import time
 
-import paho.mqtt.client as mqtt
+from pymongo import MongoClient
 
-# --- broker ---
-BROKER = os.getenv("MQTT_BROKER", "localhost")
-if "--broker" in sys.argv:
-    BROKER = sys.argv[sys.argv.index("--broker") + 1]
-PORT = 1883
+DB_URI = "mongodb://localhost:27017"
+DB_NAME = "RiverGuard"
 
-# --- demo cadence (the only mode) ---
-TICK = 0.1                    # loop ticks 10x per second
-TELEMETRY_INTERVAL = 50       # a node's telemetry every ~5 s
-ROUTE_INTERVAL = 80           # a route report every ~8 s
-QUIET_AFTER = 120             # the quiet node falls silent after ~2 min
-BLACKLIST_TICKS_PER_DAY = 30  # timeline "day" N -> policy change ~N*3 s
-
-# --- scenario: shared with the seeder (one topology truth) ---
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                "..", "seeder"))
-from generate_scenario import load, build_adjacency, compute_route_table
-
-stop_event = threading.Event()
-
-def signal_handler(signum, frame):
-    stop_event.set()
-signal.signal(signal.SIGINT, signal_handler)
-signal.signal(signal.SIGTERM, signal_handler)
+PARSER_CONTAINER = "riverguard-parser"
+BROKER_CONTAINER = "riverguard-eclipse"
+BLACKLIST_TOPIC = "mesh/control/blacklist"
 
 
-def make_client():
-    """paho 1.x / 2.x compatible constructor (2.x requires the
-    callback-API argument; 1.x has no such attribute)."""
-    try:
-        return mqtt.Client(mqtt.CallbackAPIVersion.VERSION1)
-    except AttributeError:
-        return mqtt.Client()
+def docker(*args):
+    """Run a docker command quietly; returns True/False."""
+    r = subprocess.run(["docker", *args], capture_output=True, text=True)
+    return r.returncode == 0
 
 
-class NodeThread(threading.Thread):
-    """One node: its own MQTT client, its own cadence, its own state."""
-
-    def __init__(self, node_id, route_table, struggle=False, quiet=False):
-        super().__init__(daemon=True, name=node_id)
-        self.id = node_id
-        self.route_table = route_table
-        self.struggle = struggle
-        self.quiet = quiet
-        self.client = make_client()
-        # live state (accumulates like real counters)
-        self.seq = 0
-        self.topo_seq = 0
-        self.tx = random.randint(20, 60)
-        self.rx = 0
-        self.txb = random.randint(800, 2400)
-        self.rxb = 0
-        self.up = random.randint(30, 90)
-        self.sf = 7
-
-    def publish(self, topic, payload, qos):
-        self.client.publish(topic, json.dumps(payload), qos=qos)
-
-    def telemetry(self):
-        self.seq += 1
-        sent = random.randint(6, 14)
-        self.tx += sent
-        self.rx += int(sent * random.uniform(0.82, 0.99))
-        self.txb += sent * 41
-        self.rxb += int(sent * 39)
-        self.up += 5
-        if self.struggle and self.sf < 12 and self.seq % 3 == 0:
-            self.sf += 1          # the struggler: SF climbs toward 12
-        self.publish(f"mesh/{self.id}/telemetry", {
-            "node": self.id, "uptime_minute": self.up,
-            "sequence": self.seq,
-            "tx_packets": self.tx, "rx_packets": self.rx,
-            "tx_bytes": self.txb, "rx_bytes": self.rxb,
-            "sf": self.sf}, qos=1)
-
-    def route_report(self):
-        # the node's scenario route table, RSSI/SNR jittered per report
-        self.topo_seq += 1
-        routes = []
-        for base in self.route_table:
-            rt = dict(base)
-            if rt.get("ri") is not None:
-                rt["ri"] = rt["ri"] + random.randint(-3, 3)
-                rt["sn"] = round(max(3.0, rt["sn"] - random.uniform(0, 1.5)), 1)
-            routes.append(rt)
-        self.publish(f"mesh/route/{self.id}",
-                     {"s": self.topo_seq, "g": self.up * 60000,
-                      "r": routes}, qos=0)
-
-    def run(self):
-        try:
-            self.client.connect(BROKER, PORT, 60)
-            self.client.loop_start()
-        except Exception as e:
-            print(f"[sim] {self.id} could not connect: {e}")
-            return
-        time.sleep(random.uniform(0, 3 * TICK))     # staggered starts
-        tel_in, route_in = 0.0, random.uniform(0, ROUTE_INTERVAL)
-        elapsed = 0.0
-        while not stop_event.is_set():
-            stop_event.wait(TICK)          # interruptible
-            elapsed += TICK
-            tel_in += TICK
-            route_in += TICK
-            if self.quiet and elapsed >= QUIET_AFTER:
-                print(f"[sim] {self.id} went silent")
-                break
-            if tel_in >= TELEMETRY_INTERVAL:
-                tel_in = 0.0
-                self.telemetry()
-            if route_in >= ROUTE_INTERVAL:
-                route_in = 0.0
-                self.route_report()
-        self.client.loop_stop()
-        self.client.disconnect()
+def container_running(name):
+    r = subprocess.run(
+        ["docker", "ps", "--filter", f"name={name}",
+         "--filter", "status=running", "--format", "{{.Names}}"],
+        capture_output=True, text=True)
+    return name in r.stdout
 
 
-def policy_thread(station_id, timeline):
-    """The station: runs the scenario's blacklist timeline on schedule,
-    contract-style (QoS 0, retained - the broker keeps the latest)."""
-    client = make_client()
-    try:
-        client.connect(BROKER, PORT, 60)
-        client.loop_start()
-    except Exception as e:
-        print(f"[sim] station {station_id} could not connect: {e}")
-        return
-    prev_day = 0
-    for entry in timeline:
-        # wait the gap since the previous policy, not from t=0
-        if stop_event.wait((entry["day"] - prev_day)
-                           * BLACKLIST_TICKS_PER_DAY * TICK):
-            break
-        prev_day = entry["day"]
-        payload = {k: entry[k] for k in ("v", "sequence", "edges")}
-        client.publish("mesh/control/blacklist", json.dumps(payload),
-                       qos=0, retain=True)
-        print(f"[sim] {station_id}: policy seq {payload['sequence']} "
-              f"({len(payload['edges'])} edge(s) disabled)")
-    client.loop_stop()
-    client.disconnect()
+def clear_retained_blacklist():
+    """Unset the retained blacklist on the broker.
+
+    mosquitto_pub -r -n publishes a NULL payload with the retain flag -
+    per the MQTT spec this removes the retained message, so the
+    restarted parser gets nothing on resubscribe. Runs inside the
+    broker container, so no host-side MQTT tools are needed.
+    """
+    r = subprocess.run(
+        ["docker", "exec", BROKER_CONTAINER, "mosquitto_pub",
+         "-t", BLACKLIST_TOPIC, "-r", "-n"],
+        capture_output=True, text=True)
+    return r.returncode == 0
 
 
 def main():
-    random.seed()   # a live sim should be alive
+    client = MongoClient(DB_URI)
 
-    scenario = load()
+    was_running = container_running(PARSER_CONTAINER)
 
-    # route tables once per node - real Dijkstra over the scenario links
-    nodes, route_tables = [], {}
-    for island in scenario["islands"]:
-        adj = build_adjacency(island["links"])
-        for nid in island["nodes"] + [island["station"]]:
-            nodes.append(nid)
-            route_tables[nid] = compute_route_table(adj, nid)
+    print(f"Dropping the ENTIRE database '{DB_NAME}'.")
+    if was_running:
+        print("(parser is running - it will be stopped and restarted)")
+    if "--yes" not in sys.argv and input("Type 'yes' to confirm: ").strip() != "yes":
+        print("Cancelled.")
+        return
 
-    # the two stories: distinct, and never a station
-    cast = [n for i in scenario["islands"] for n in i["nodes"]]
-    struggler, quiet = random.sample(cast, 2)
+    # 1. stop the parser (no mid-clear writes; restart recreates indexes)
+    if was_running:
+        docker("stop", PARSER_CONTAINER)
+        print(f"[clear] {PARSER_CONTAINER} stopped")
 
-    threads = []
-    for nid in nodes:
-        threads.append(NodeThread(
-            nid, route_tables[nid],
-            struggle=(nid == struggler), quiet=(nid == quiet)))
+    # 2. drop the whole database (indexes included - the parser
+    #    recreates them on startup)
+    client.drop_database(DB_NAME)
+    print(f"[clear] database '{DB_NAME}' dropped")
 
-    for t in threads:
-        t.start()
-        time.sleep(0.05)   # staggered client connections, like real boots
+    # 3. unset the retained blacklist BEFORE the parser restarts, or
+    #    the broker re-delivers it and the old policy comes back
+    if container_running(BROKER_CONTAINER):
+        if clear_retained_blacklist():
+            print(f"[clear] retained blacklist unset on {BROKER_CONTAINER}")
+        else:
+            print(f"[clear] WARNING: could not unset the retained blacklist -")
+            print(f"[clear] the old policy will return when the parser restarts.")
+    else:
+        print(f"[clear] note: broker not running - a retained blacklist (if any)")
+        print(f"[clear] survives in mqtt/data and returns when it next starts.")
 
-    timeline = scenario.get("blacklist_timeline", [])
-    if timeline:
-        station = scenario["islands"][0]["station"]
-        threading.Thread(target=policy_thread, args=(station, timeline),
-                         daemon=True).start()
+    # 4. restart the parser
+    if was_running:
+        docker("start", PARSER_CONTAINER)
+        print(f"[clear] {PARSER_CONTAINER} restarted (indexes recreated)")
 
-    print(f"[sim] {len(threads)} nodes live on {BROKER}:{PORT} (fast cadence)")
-    print(f"[sim] struggler: {struggler} (SF will climb) | "
-          f"quiet: {quiet} (silent after ~2 min)")
-    print(f"[sim] watch: http://localhost:8000 - Stream tab live, "
-          f"graph shows the stories. Ctrl+C to stop.")
-    while not stop_event.is_set():
-        stop_event.wait(1.0)
-
-    print("[sim] stopped.")
+    print("[clear] done. Website: refresh to see the empty state.")
 
 
 if __name__ == "__main__":

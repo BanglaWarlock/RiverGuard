@@ -30,6 +30,11 @@ function handleMeshEvent(msg) {
         Object.assign(meshNodes[id], msg.data.payload, { last_seen: msg.ts });
         if (selectedNode === id) renderSideCard();
         graphRender();
+        const g = gNodes.querySelector(`g.node[data-id="${id}"]`);
+        if (g) {
+            g.classList.add("pulse");
+            setTimeout(() => g.classList.remove("pulse"), 1200);
+        }
     } else if (ev === "route" && id) {
         // summary only - refetch that node's newest report
         api(`/mesh/routes?node_id=${id}&limit=1`).then(rs => {

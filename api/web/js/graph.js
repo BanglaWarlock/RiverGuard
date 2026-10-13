@@ -27,6 +27,7 @@ function graphInit() {
     // pan: drag on empty canvas
     let panning = null;
     host.addEventListener("mousedown", e => {
+        e.preventDefault();
         if (e.target === svg || e.target === gWorld) {
             panning = { x: e.clientX, y: e.clientY, vx: view.x, vy: view.y };
             host.classList.add("dragging");
@@ -168,11 +169,11 @@ function graphRender() {
 
         g.addEventListener("mousemove", ev => showNodeTip(ev, id));
         g.addEventListener("mouseleave", hideTip);
-        g.addEventListener("click", () => { selectedNode = id; graphRender(); renderSideCard(); });
 
         // drag: move node, persist
         let drag = null;
         g.addEventListener("mousedown", ev => {
+            e.preventDefault();
             ev.stopPropagation();
             drag = { dx: ev.clientX, dy: ev.clientY, ox: pos.x, oy: pos.y };
             const move = e2 => {
@@ -189,9 +190,18 @@ function graphRender() {
             const up = () => {
                 window.removeEventListener("mousemove", move);
                 window.removeEventListener("mouseup", up);
-                positionsOut[id] = pos;
-                savePositions(positionsOut);
-                graphRender();
+                if (drag.moved) {
+                    positionsOut[id] = pos;
+                    savePositions(positionsOut);
+                    graphRender();   // element replaced; click won't fire - fine, it was a drag
+                } else {
+                    // it was a click: select HERE. The browser's click event will
+                    // never arrive (graphRender below replaces this element), so
+                    // selection must not depend on the click listener.
+                    selectedNode = id;
+                    graphRender();
+                    renderSideCard();
+                }
             };
             window.addEventListener("mousemove", move);
             window.addEventListener("mouseup", up);

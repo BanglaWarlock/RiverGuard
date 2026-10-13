@@ -1,3 +1,7 @@
+// map defaults: Kuching area until nodes are placed
+const MAP_CENTER = [1.55, 110.35];
+const MAP_ZOOM = 11;
+
 // All knobs: API address, palettes, thresholds.
 const API_BASE = "http://127.0.0.1:8000";
 
